@@ -1,0 +1,372 @@
+---
+title: "NYPD Shooting Analysis"
+author: "Jesse Keyton"
+date: "12/7/2024"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+```
+
+# Load and View Data
+
+```{r get_data, message=FALSE}
+NYPD_Data_read <- read_csv(
+'https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD'
+)
+```
+
+Per the website from where this data was extracted, this data set records the shootings that occurred in NYC 2006 up through the end of 2023. By glancing at the column names, we see that each incident records the date, time, location, and victim/offender details when they are available. Since we will not be referencing particular events, we will remove the identification number (INCIDENT_KEY) and the location coordinates of the shooting. 
+
+**Variable Types**: We need to convert the date to a date variable and the age groups into factor groups, since there is a natural order associated with age. 
+
+**Missing/Strange Values**: To determine what else needs to be considered for cleaning, I use some summary functions to explore the variables and see where there is missing or other strange data. 
+
+  - *Null Values*: Converted these to NA
+
+  - *Unknown Values*: Some variables had an "UNKNOWN" category, but the NA or Null values were not included. I put these all together.
+  
+  - *Strange Values*: There are a few one-off cases where the age group value looked strange. It could be that whoever entered the data mis-typed. Since I couldn't be sure about what was meant to be typed, I put each of these cases in the "UNKNOWN" category.
+
+```{r tidy_data}
+#Remove columns that will not be needed for analysis
+#Also use factor groupings and correct date types
+NYPD_Data <- NYPD_Data_read %>% 
+  select(-INCIDENT_KEY, -X_COORD_CD, -Y_COORD_CD, 
+         -Latitude, -Longitude, -Lon_Lat) %>% 
+  mutate(
+    OCCUR_DATE = mdy(OCCUR_DATE),
+    PERP_AGE_GROUP = if_else(is.na(PERP_AGE_GROUP) | PERP_AGE_GROUP == "(null)", 
+                             "UNKNOWN", PERP_AGE_GROUP),
+    VIC_AGE_GROUP = if_else(is.na(VIC_AGE_GROUP), "UNKNOWN", VIC_AGE_GROUP),
+    PRECINCT = as.factor(PRECINCT),
+    JURISDICTION_CODE = as.factor(JURISDICTION_CODE)
+  ) 
+
+#Every legitimate group had the symbols "-", "<", or "+". So we'll flag
+#all groups without those symbols and move them to UNKNOWN
+rmv_perp_age_grp <- NYPD_Data$PERP_AGE_GROUP %>% unique()
+rmv_perp_age_grp <- rmv_perp_age_grp[rmv_perp_age_grp!="UNKNOWN"]
+rmv_perp_age_grp <- rmv_perp_age_grp[!(grepl("[-<+]", rmv_perp_age_grp))]
+
+rmv_vic_age_grp <- NYPD_Data$VIC_AGE_GROUP %>% unique()
+rmv_vic_age_grp <- rmv_vic_age_grp[rmv_vic_age_grp!="UNKNOWN"]
+rmv_vic_age_grp <- rmv_vic_age_grp[!(grepl("[-<+]", rmv_vic_age_grp))]
+
+cat("Potentially Mistyped Age groups:", 
+    paste(c(rmv_perp_age_grp, rmv_vic_age_grp), collapse = " "), 
+    "\n")
+
+
+#Finish the clean up by making age groups into factor groups and 
+#assigning nulls as NAs.
+NYPD_Data <- NYPD_Data %>% 
+  mutate(
+    PERP_AGE_GROUP = if_else(PERP_AGE_GROUP %in% rmv_perp_age_grp, 
+                             "UNKNOWN", PERP_AGE_GROUP),
+    PERP_AGE_GROUP = as.factor(PERP_AGE_GROUP),
+    VIC_AGE_GROUP = if_else(VIC_AGE_GROUP %in% rmv_vic_age_grp, 
+                            "UNKNOWN", VIC_AGE_GROUP),
+    VIC_AGE_GROUP = as.factor(VIC_AGE_GROUP)
+  ) %>% 
+  mutate_if(is.character, ~ na_if(., "(null)")) %>% 
+  mutate(
+    PERP_SEX = if_else(is.na(PERP_SEX), "U", PERP_SEX),
+    VIC_SEX = if_else(is.na(VIC_SEX), "U", VIC_SEX),
+    PERP_RACE = if_else(is.na(PERP_RACE), "UNKNOWN", PERP_RACE),
+    VIC_RACE = if_else(is.na(VIC_RACE), "UNKNOWN", VIC_RACE),
+  )
+
+#To see how many NA values there are for each column, first for character 
+#columns and then for the others
+# NYPD_Data %>%
+#   select_if(is.character) %>%
+#   summarize(across(everything(), ~ sum(is.na(.)), .names = "NAs_{col}"))
+# 
+# NYPD_Data %>%
+#   select_if(~!is.character(.)) %>%
+#   summarize(across(everything(), ~ sum(is.na(.)), .names = "NAs_{col}"))
+
+summary(NYPD_Data)
+```
+
+# Analysis: Shootings by Hour and Age Group
+
+To start analyzing the data, my mind first went to the distribution of shootings
+at different times of the day. I'll first look at some high-level summary data 
+to see what we can learn.
+
+```{r visualize_data_by_hour}
+#View distribution of variables of interest 
+#table(NYPD_Data$VIC_AGE_GROUP)
+#table(NYPD_Data$PERP_AGE_GROUP)
+#table(NYPD_Data$BORO)
+
+#Group Shootings and Deaths by Hour
+Hour_Totals <- NYPD_Data %>% 
+  mutate(
+    shooting_hour = hour(OCCUR_TIME),
+    death_flag = if_else(STATISTICAL_MURDER_FLAG, 1, 0)
+  ) %>% 
+  group_by(shooting_hour) %>% 
+  summarize(
+    total_shootings = n(),
+    total_deaths = sum(death_flag),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    deaths_per_shooting = total_deaths/total_shootings
+  )
+
+Hour_Totals %>% 
+  ggplot(aes(x = shooting_hour)) +
+  geom_bar(aes(y = total_shootings), stat = "identity", 
+           fill = "blue", alpha = 0.2) +
+  geom_line(aes(y = total_deaths), color = "red") +  
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Shootings and Deaths by Hour of Day", 
+       x = "Hour",
+       y = NULL)
+
+#Are shootings more lethal during certain hours?
+Hour_Totals %>% 
+  ggplot(aes(x=shooting_hour)) +
+  geom_line(aes(y=deaths_per_shooting)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Proportion of Lethal Shootings by Hour", 
+       x = "Hour",
+       y = NULL)
+```
+
+By first looking at the number of occurrences of shootings by hours, we see that
+shootings occur more frequently when the sun is down, peaking around midnight 
+and lowest at around 9AM. Interestingly, the most lethal shootings seem to 
+occur early in the morning, peaking at 7AM with a proportion of 30%. The least
+lethal time is at 4PM. It makes me wonder if there is more "intent" early in 
+morning, and more "horseplay" accidents after school or work hours. In the next 
+part of the analysis we look at age groups to help better tell the story.
+
+First let's review the age group distributions.
+
+```{r age_group_dist}
+table(NYPD_Data$VIC_AGE_GROUP)
+table(NYPD_Data$PERP_AGE_GROUP)
+```
+Notice that we have 13.7K unknown ages for the shooter. Because of that, we're
+just going to focus on the victim's age, which is recorded 99.8% of the time.
+
+
+```{r visualize_data}
+#Include Victim Age Group into the summary, removing the UNKOWN category.
+Hour_Age_Summary <- NYPD_Data %>% 
+  filter(VIC_AGE_GROUP != "UNKNOWN") %>% 
+  mutate(
+    shooting_hour = hour(OCCUR_TIME),
+    death_flag = if_else(STATISTICAL_MURDER_FLAG, 1, 0),
+  ) %>% 
+  group_by(shooting_hour, VIC_AGE_GROUP) %>% 
+  summarize(
+    shootings = n(),
+    deaths = sum(death_flag),
+    .groups = "drop"
+  ) %>% 
+  inner_join(Hour_Totals, by = "shooting_hour") %>% 
+  mutate(
+    pct_deaths_by_age = deaths/shootings,
+    pct_shootings_by_hour = shootings/total_shootings
+  )
+
+#Shootings by Hour and Age
+Hour_Age_Summary %>% 
+  ggplot(aes(x = shooting_hour, y = shootings, color = VIC_AGE_GROUP)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Shootings by Hour and Victim Age Group", 
+       x = "Hour",
+       y = NULL)
+
+#Which Age Group Most Likely at each Hour
+Hour_Age_Summary %>% 
+  ggplot(aes(x = shooting_hour, y = pct_shootings_by_hour, 
+             color = VIC_AGE_GROUP)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Victim Age % Shooting by Hour", 
+       x = "Hour",
+       y = NULL)
+
+#Lethality of Shootings by Victim Age
+Hour_Age_Summary %>% 
+  filter(VIC_AGE_GROUP != "65+") %>% 
+  ggplot(aes(x = shooting_hour, y = pct_deaths_by_age, 
+             color = VIC_AGE_GROUP)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Victim Age % Lethal Shootings", 
+       x = "Hour",
+       y = NULL)
+```
+
+From the first two visuals we observe that most shooting victims are between the 
+ages of 25 and 44. Recall that the most lethal shootings occurred at around 7AM. 
+The victim age group between 25 and 44 made up about 60% of the shootings at that
+time and 32% of the lethal shootings. 
+
+The lowest frequency occurs for victims 65 years or older, followed by <18 
+year-olds or 45-64 year-olds, depending on the time of day. However, victims
+who were 45+ were far more likely to die by the shooting. In particular, the 65+
+age group was not included because they were shot much less, but died much more
+often, so their graph became a distraction for the others.
+
+Without going too much into the statistics, by looking at these high-level 
+summaries I have learned that most shootings have victims in the age range of
+18-44, but the most lethal shootings (by percentage within the age group) is for
+the ages 45 and above. Moreover, most of these shootings occur while the sun is
+down. During those hours, people are more likely to be in school (especially the
+<18 group) or work.
+
+# Modeling Shootings by Hour and Boro
+
+Next, we use the underlying distribution of shootings times to build a linear 
+model that could help predict shootings in certain neighborhoods, or help explain
+some significant factors in the shooting occurrences.
+
+Recall the distribution of shootings by hour.
+
+```{r hour_distribution}
+NYPD_Data %>% 
+  mutate(
+    hour = hour(OCCUR_TIME),
+  ) %>% 
+  ggplot(aes(x=hour)) +
+  geom_bar()
+```
+
+To use linear regression, we'll focus on one piece of the day: after 9AM. 
+If the model proves useful, itcould easily be replicated to build a linear model 
+that *decreases* from 1AM to 9AM.
+
+```{r model_data}
+#Grouping by minutes after 9AM, broken into 15-minute chunks.
+#Converting to minutes so I can use a numerical predictor.
+After_9AM_by_Boro <- NYPD_Data %>% 
+  filter(
+    hour(OCCUR_TIME) >= 9
+  ) %>% 
+  mutate(
+    hour = as.numeric(hour(OCCUR_TIME)),
+    minute = floor(as.numeric(minute(OCCUR_TIME))/15)*15,
+    minutes_after_9 = (hour-9)*60 + minute,
+    weekday = wday(OCCUR_DATE, label = TRUE),
+    weekday = factor(weekday, ordered = FALSE)
+  ) %>% 
+  group_by(
+    weekday, minutes_after_9, BORO
+  ) %>% 
+  summarize(
+    total_shootings = n(),
+    .groups = "drop"
+  )
+
+#Linear Regression using minutes, weekday, and neighborhood as predictors
+model <- lm(total_shootings ~ minutes_after_9 + weekday + BORO, data = After_9AM_by_Boro)
+
+summary(model)
+```
+
+From the linear regression summary, we see that the most significant predictors
+are the time (minutes after 9AM), if it's a Monday or Friday, and each neighborhood
+is also a significant factor. From the coefficients of these variables, we can infer
+that Mondays and Fridays have more shootings, and Brooklyn and the Bronx have more
+shootings (we get the Bronx from the intercept coefficient).
+
+Next we see how well the model matches reality.
+
+```{r model_data_predict}
+#Adding predictions, then graphing predictions and actuals
+After_9AM_by_Boro %>% 
+  mutate(
+    pred_shootings = predict(model)
+  ) %>% 
+  group_by(minutes_after_9) %>% 
+  summarize(
+    total_shootings = sum(total_shootings),
+    pred_shootings = sum(pred_shootings),
+    .groups = "drop"
+  ) %>% 
+  ggplot() + 
+  geom_point(aes(x = minutes_after_9, y = total_shootings), color = "blue") +
+  geom_line(aes(x = minutes_after_9, y = pred_shootings), color = "red")
+
+After_9AM_by_Boro %>% 
+  mutate(
+    pred_shootings = predict(model)
+  ) %>% 
+  group_by(BORO, minutes_after_9) %>% 
+  summarize(
+    total_shootings = sum(total_shootings),
+    pred_shootings = sum(pred_shootings),
+    .groups = "drop"
+  ) %>% 
+  ggplot() + 
+  geom_point(aes(x = minutes_after_9, y = total_shootings, color = BORO)) +
+  geom_line(aes(x = minutes_after_9, y = pred_shootings, color = BORO))
+
+```
+Overall, at an aggregate level, the model seems to track pretty well with actual.
+Once we look at the neighborhood level, we see more variance in the model. If this
+we an actionable analysis, it would be good to consider ways to improve the models
+at the neighborhood level, especially since any action would have an impact on the
+residents.
+
+# Conclusion
+
+In this analysis, my goal was to explore the relationship between shootings and 
+the following variables: time of day, age group, and neighborhoods. I also 
+considered the lethal shootings for the time of day and age groups. To reiterate 
+my conclusion stated above, most victims were between 18 and 44 years-old, but 
+when a victim was 45+, they were more likely to die from the shooting. Most of these 
+shootings occur while the sun is down. 
+
+From the regression analysis, we were able to find a model that predicted the 
+number of shooting at each hour in the day after 9AM. The most significant 
+predictors in the model were the time, if the day was a Monday or Friday, and if
+the neighborhood was Brooklyn or Bronx. In particular, the model suggests that
+shootings increase after 9AM, occur more often on Mondays and Friday, and also
+occur more in Brooklyn and the Bronx.
+
+**Limitations and Bias**. There are many limitations and biases of a high-level summary. For
+instance, since I am working with the raw data provided by the government website,
+I am not restricting any kind of time frame. The data goes back to 2006, and up
+through 2023, so there could be seasonal or year-over-year trends that I am 
+completely ignoring. There have also been several economic crises and a pandemic
+in the time frame, and possibly other events that ought to be considered for this
+type of analysis. Moreover, since I found a few errors that seemed to be typos,
+there could be many other "human" errors that are harder to catch. It would be 
+good to know how the data was recorded in the first place, and if that process has
+improved over the years since 2006. 
+
+As far as personal bias, two thoughts came to mind. First, this isn't a topic
+I would have naturally picked myself. It is interesting, but not the type of data
+I would gravitate to. Secondly, my first thought when viewing the regression model
+was if something like this could be used for allocating police officers more to 
+certain areas. While I don't think that would be a bad idea, I recognize there
+could be many other ways to address shootings. Whatever policy decision is made,
+it's important to weigh many different approaches and select the right balance.
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
