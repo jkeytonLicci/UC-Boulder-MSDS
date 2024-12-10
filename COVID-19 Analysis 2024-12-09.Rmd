@@ -1,0 +1,360 @@
+---
+title: "COVID19 Analysis"
+author: "Jesse Keyton"
+date: "12/7/2024"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include = FALSE}
+library(tidyverse)
+library(lubridate)
+
+url_in <- 'https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/'
+
+file_names <- c("time_series_covid19_confirmed_global.csv", 
+                "time_series_covid19_deaths_global.csv",
+                "time_series_covid19_confirmed_US.csv",
+                "time_series_covid19_deaths_US.csv")
+
+urls <- str_c(url_in, file_names)
+
+#For Populations
+uid_lookup_url <- 'https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv'
+uid <- read_csv(uid_lookup_url) %>% 
+  select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2))
+
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+US_cases <- read_csv(urls[3])
+US_deaths <- read_csv(urls[4])
+```
+
+# Introduction
+
+This analysis uses COVID19 data from John Hopkins' Github site. After accessing the data, we tidy the data following
+guidance from the lectures. In particular, we aggregate the number of cases and death by location from the start of COVID19 through
+March 2023. 
+
+The focus of this analysis is on the deaths per 1,000 people in the population of each state or province. The question we try to answer is: *Does the population size
+influence the deaths per 1,000 people?* The reason I find this question interesting is that the "per 1,000" is often use to normalize a feature in the population in
+order to better understand the feature. It is the same reason one considers "per capita" when evaluating different regional metrics. In this case, viral diseases might flourish in denser populations, which would then disproportionately affect the number of deaths. Our basic analysis tries to examine this idea.
+
+# Tidy Data
+
+
+```{r tidy_data}
+
+#The data is imporated with dates organized by column. The long format allows
+#for time series graphs and makes it easier to compute summary statistics
+global_cases <- global_cases %>% 
+  pivot_longer(
+    cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+    names_to = "date",
+    values_to = "cases"
+  ) %>% 
+  select(-Lat, -Long)
+
+global_deaths <- global_deaths %>% 
+  pivot_longer(
+    cols = -c(`Province/State`, `Country/Region`, Lat, Long),
+    names_to = "date",
+    values_to = "deaths"
+  ) %>% 
+  select(-Lat, -Long)
+
+global <- global_cases %>% 
+  full_join(global_deaths) %>% 
+  rename(
+    Country_Region = `Country/Region`,
+    Province_State = `Province/State`
+  ) %>% 
+  mutate(
+    date = mdy(date),
+    cases = coalesce(cases, 0),
+    deaths = coalesce(deaths, 0)
+  ) 
+
+US_cases <- US_cases %>% 
+  pivot_longer(
+    cols = -(UID:Combined_Key),
+    names_to = "date",
+    values_to = "cases"
+  ) %>% 
+  select(Admin2:cases) %>% 
+  mutate(
+    date = mdy(date)
+  ) %>% 
+  select(-c(Lat, Long_))
+
+US_deaths <- US_deaths %>% 
+  pivot_longer(
+    cols = -(UID:Population),
+    names_to = "date",
+    values_to = "deaths"
+  ) %>% 
+  select(Admin2:deaths) %>% 
+  mutate(
+    date = mdy(date)
+  ) %>% 
+  select(-c(Lat, Long_))
+
+US <- US_cases %>% 
+  full_join(US_deaths) %>% 
+  filter(cases>0)
+
+#The global dataset does not include country population, so we use an extra
+#datasource from the same GitHub location to pull in the population
+global <- global %>% 
+  unite(
+    "Combined_Key",
+    c(Province_State, Country_Region),
+    sep = ", ",
+    na.rm = TRUE,
+    remove = FALSE
+  )
+
+global <- global %>% 
+  left_join(
+    uid, by = c("Province_State", "Country_Region")
+  ) %>% 
+  select(Province_State, Country_Region, date, cases, 
+         deaths, Population, Combined_Key) %>% 
+  filter(cases>0)
+
+Canada <- global %>% 
+    group_by(Country_Region, date) %>% 
+    summarize(
+        cases = sum(cases),
+        deaths = sum(deaths),
+        Population = sum(Population, na.rm = TRUE),
+        .groups = "drop"
+    ) %>% filter(Country_Region == "Canada")
+```
+
+# Visual Analyses
+
+With the data prepared, I start with visuals that divide the US state/provinces
+into groups and creates a box-and-whisker plot for the number of deaths per 1,000
+people. I tested various percentiles to divide the data and chose terciles. There were
+about 19 states/provinces in each group with this decision, which provided enough
+groups to look for a difference in deaths per 1,000 people, while not allowing the
+group sizes to get too low. 
+
+
+```{r visualize_data_states}
+
+US_by_state <- US %>% 
+  group_by(Province_State, Country_Region, date) %>% 
+  summarize(
+    cases = sum(cases),
+    deaths = sum(deaths),
+    Population = sum(Population),
+    .groups = "drop"
+  ) %>% 
+  filter(
+    Population > 0, cases > 0
+  ) 
+
+US_state_totals <- US_by_state %>% 
+  group_by(Province_State) %>% 
+  summarize(
+    deaths = max(deaths),
+    cases = max(cases),
+    population = max(Population),
+    deaths_per_thou = 1000*deaths/population,
+    .groups = "drop"
+  ) 
+
+#Finding the populations at the cutoff points for the terciles
+us_pop_quartiles <- quantile(US_state_totals$population, c(0.33, 0.67))
+
+US_state_totals %>% 
+  mutate(
+    pop_group = case_when(
+      population <= us_pop_quartiles[[1]] ~ "Bottom_3rd",
+      population <= us_pop_quartiles[[2]] ~ "Middle",
+      TRUE ~ "Top_3rd"
+    ),
+    pop_group = factor(pop_group, 
+                       levels = c("Bottom_3rd", "Middle", "Top_3rd"))
+  ) %>% 
+  ggplot(aes(x=pop_group, y=deaths_per_thou)) +
+  geom_boxplot() +
+  labs(title = "US Deaths Per Thousand by Population Size", 
+       x = "Population Group", 
+       y = "Deaths per 1,000 People")
+```
+
+The Middle and Top groups appear similar, which the median deaths per 1,000 people about
+the same, although the Middle has more variance. Noticeably, the Bottom 3rd group has
+a lower death per 1,000 people overall. Moreover, this group had the most variance, which is important to recognize. 
+The high variance makes sense, for the same reason that smaller sample sizes experience a greater degree of variance. 
+
+Next, I look at the same analysis for countries instead of states/provinces. This time, I divide into 5
+groups because there are many more countries globally than there are states/provinces in the US.
+
+
+```{r visualize_data_countries}
+#Included the na.rm = TRUE because some regions of countries had NA values for 
+#population (e.g. Canada), and the NAs were producing misleading results
+Totals_by_Country <- global %>% 
+  group_by(Country_Region, date) %>% 
+  summarize(
+    cases = sum(cases),
+    deaths = sum(deaths),
+    Population = sum(Population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  filter(
+    Population > 0, cases > 0
+  ) %>% 
+  group_by(Country_Region) %>% 
+  summarize(
+    deaths = max(deaths),
+    cases = max(cases),
+    population = max(Population),
+    deaths_per_thou = 1000*deaths/population,
+    .groups = "drop"
+  ) 
+
+#Finding the populations at the cutoff points for the quintiles
+country_pop_quartiles <- quantile(Totals_by_Country$population, 
+                                  c(0.20, 0.40, 0.60, 0.80))
+
+Countries_Grouped <- Totals_by_Country %>% 
+  mutate(
+    pop_group = case_when(
+      population <= country_pop_quartiles[[1]] ~ "Bottom_20th",
+      population <= country_pop_quartiles[[2]] ~ "40th",
+      population <= country_pop_quartiles[[3]] ~ "60th",
+      population <= country_pop_quartiles[[4]] ~ "80th",
+      TRUE ~ "Top_20th"
+    ),
+    pop_group = factor(pop_group, 
+                       levels = c("Bottom_20th", "40th", 
+                                  "60th", "80th", "Top_20th"))
+  )
+
+Countries_Grouped %>% 
+  ggplot(aes(x=pop_group, y=deaths_per_thou)) +
+  geom_boxplot() +
+  labs(title = "Country Deaths Per Thousand by Population Size", 
+       x = "Population Group", 
+       y = "Deaths per 1,000 People")
+
+Countries_80 <- Countries_Grouped %>% 
+  filter(pop_group == "80th")
+
+```
+
+This visual is interesting and difficult to explain. Groups 2 and 3 (in terms of size) are similar in median and spread
+of deaths per 1,000 people. Group 1 is also mostly similar, with a slightly lower median and an outlier. Group 4 stands out the most, and would require
+more investigation at the individual countries to better explain the picture. There were some African countries, and North Korea, that were bringing the 
+median deaths per 1,000 people lower. This group also included the country with the highest deaths per 1,000 people: Peru. 
+
+# Modeling the Data
+
+These Box Plots suggest there is some variance within the population size and the deaths per 1,000 people by COVID 19. Focusing on the US, we saw more variance in
+smaller populations with generally lower deaths per 1,000 people. In the final part of this analysis, I'll test for significant linear relationships. 
+We first consider all US states/provinces and then contrast with the bottom 3rd states in terms of population size. The test will be for a linear significance between
+population and deaths per 1,000 people by COVID-19.
+
+```{r modeling_data_all}
+#First build model for all US states
+model_full <- lm(deaths_per_thou ~ population, data = US_state_totals)
+summary(model_full)
+
+US_tot_w_pred <- US_state_totals %>% mutate(pred = predict(model_full))
+
+US_tot_w_pred %>% 
+  ggplot() + 
+  geom_point(aes(x = population, y = deaths_per_thou), color = "blue") +
+  geom_point(aes(x = population, y = pred), color = "red") +
+  geom_line(aes(x = population, y = pred), color = "red") +
+  labs(title = "US Deaths Per Thousand by State Population Size", 
+       x = "Population", 
+       y = "Deaths per 1,000 People")
+```
+
+This model has very low statistical significance, and can be seen by the graph that it has
+low explanatory power for deaths per 1,000. Let's consider the bottom 3rd next.
+
+
+```{r modeling_data_bottom3rd}
+US_states_Bottom_3rd <- US_state_totals %>% 
+  filter(population <= us_pop_quartiles[[1]])
+
+model_half <- lm(deaths_per_thou ~ population, data = US_states_Bottom_3rd)
+summary(model_half)
+
+US_Bottom_3rd_w_pred <- US_states_Bottom_3rd %>% mutate(pred = predict(model_half))
+
+US_Bottom_3rd_w_pred %>% 
+  ggplot() + 
+  geom_point(aes(x = population, y = deaths_per_thou), color = "blue") +
+  geom_point(aes(x = population, y = pred), color = "red") +
+  geom_line(aes(x = population, y = pred), color = "red") +
+  labs(title = "US Deaths Per Thousand by State Population Size - Bottom 3rd", 
+       x = "Population", 
+       y = "Deaths per 1,000 People")
+
+```
+
+The model for these smaller population states/regions has higher significance, with a p-value of
+0.023. However, the R^2 is pretty low at 23%, so it still does not seem to be a great model for predicting. 
+
+Lastly, we extend the idea slightly further and consider fatality rate. Even if population size did partly
+determine the deaths per 1,000, does that suggest the virus is less lethal in those states? We consider the top and bottom two
+states and compare the fatality rate over time.
+
+```{r}
+#We require the population is at least 1/2 a million, which filtered out
+#regions not part of the contiguous US
+bottom2_states <- US_state_totals %>% 
+  filter(population > 5e5) %>% 
+  arrange(population) %>% 
+  head(2) %>% 
+  pull(Province_State)
+
+top2_states <- US_state_totals %>% 
+  arrange(desc(population)) %>% 
+  head(2) %>% 
+  pull(Province_State)
+
+
+US_by_state %>%  
+  filter(
+    Province_State %in% c(bottom2_states, top2_states)
+  ) %>% 
+  mutate(
+    fatality_rate = deaths/cases
+  ) %>% 
+  ggplot(aes(x=date, y=fatality_rate, color=Province_State)) +
+  geom_line() +
+  labs(title = "COVID Fatality Rate by Top & Bottom 2 Populations", 
+       x = "", 
+       y = "Fatality Rate")
+
+```
+
+While there is more variance at the start of the pandemic, the fatality rate starts to converge
+around the beginning of 2021, about a year into the pandemic, with a value around 0.01.
+
+# Conclusion
+
+In this analysis we considered the impact of population size on deaths per 1,000 people by COVID 19. We first looked at the US and saw
+that states/regions with smaller populations had greater variance in this metric, and that when restricting to these smaller populations
+we could get a weak, but statistically significant positive linear correlation. At the aggregate level, that correlation was not significant. 
+We also looked at countries and saw that there was some variance in different population groups. That also revealed some interesting outliers, such
+as North Korea (with little-to-no reporting) and Peru (with a very high death per 1,000 rate). While the deaths per 1,000 rate differed among different population groups, 
+we ended by showing the fatality rate of COVID 19 for two small populations and two large populations. All four seemed to converge around the same value: about 0.01.
+
+**Limitations and Bias**: North Korea is one example of limitations and/or bias in the data: different countries could have different standards of data collection, reporting, or both. There could also be personal bias: it makes sense to me intuitively that for denser populations, such as states with large cities, it is easier to contract and spread bias. The point of an analysis like this is to challenge that intuition, rather than let it mask the true story. 
+
+
+```{r}
+sessionInfo()
+```
+
